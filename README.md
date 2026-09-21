@@ -25,7 +25,7 @@ Core protections:
 - authored commit/reword/squash messages must follow Conventional Commits.
 - branch-local rewrite operations reject `main`, dirty worktrees, detached HEAD, unsupported merge-aware replay, and published rewritten commits under `local_only`.
 - merge is `--no-ff` only, runs on `main`, requires a clean tree, and uses a Conventional Commit-compatible merge message.
-- release tagging has a dedicated `git_release_tag` operation that requires clean `main` with a two-parent merge at `HEAD`.
+- release tagging has a dedicated `git_release_tag` operation that requires clean `main` with a two-parent merge at `HEAD`; enrolled repositories also require exact trusted release-gate evidence.
 - release-history recovery is exposed only through guarded semantic operations; arbitrary ref reset/tag movement is not exposed.
 
 ## Remote permissions
@@ -64,7 +64,8 @@ git_switch(branch=main)
 git_merge(source=<work-branch>, mode=no_ff)
 
 # Run project-native post-merge checks outside this MCP.
-git_release_tag(version=X.Y.Z)
+# Enrolled repositories must produce exact PASS evidence for current main HEAD.
+git_release_tag(version=X.Y.Z, release_evidence_path=<relative evidence path>)
 git_delete_branch(<work-branch>)
 ```
 
@@ -190,7 +191,10 @@ It requires:
 - current branch `main`;
 - clean tree/index;
 - two-parent merge at `HEAD`;
-- target tag does not already exist.
+- target tag does not already exist;
+- when the repository is enrolled with `--release-evidence-required-repo`, a trusted JSON evidence file below `--release-evidence-root` must prove `sonarqube-main` `PASS` for the exact current `main` HEAD and include a non-empty Sonar analysis ID.
+
+Evidence enforcement is opt-in per repository so a baseline can be established and approved before the control becomes mandatory. Missing, stale, mismatched, or non-PASS evidence fails closed.
 
 The resulting tag is annotated and named `vMAJOR.MINOR.PATCH`.
 
