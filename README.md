@@ -153,8 +153,9 @@ Guards:
 
 - current tag target must equal `expected_old_target`;
 - default remote verification must prove the tag unpublished;
-- replacement is an annotated tag;
-- the replacement tag object is created first, then the real tag ref is swapped only if the old object still matches;
+- replacement is an annotated tag whose embedded tag name exactly matches the requested canonical ref name;
+- the replacement tag object is created directly with `git mktag`, then the real tag ref is swapped only if the old object still matches;
+- no temporary annotated-tag identity is retained in the replacement object;
 - final tag target is verified.
 
 This is intended for recovery of a known-bad **local unpublished** release tag, not routine retagging.

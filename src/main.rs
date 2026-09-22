@@ -2,8 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
     path::{Component, Path, PathBuf},
-    process::Command as StdCommand,
-    sync::atomic::{AtomicU64, Ordering},
+    process::{Command as StdCommand, Stdio},
 };
 
 use anyhow::{Context, Result};
@@ -16,13 +15,12 @@ use rmcp::{
     transport::stdio,
 };
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt, process::Command};
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 16_384;
 const MAX_HISTORY_COMMITS: usize = 512;
 const DEFAULT_MAX_MERGE_COMMITS: u32 = 5;
 const PROTECTED_TRUNK: &str = "main";
-static NEXT_TEMP_TAG_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Workspace-confined multi-repository Git MCP server")]
@@ -722,6 +720,55 @@ impl GitServer {
         S: AsRef<OsStr>,
     {
         let output = self.run_git_raw(repo, args, &[]).await?;
+        if output.exit_code == Some(0) {
+            Ok(output)
+        } else {
+            Err(format_git_failure(&output))
+        }
+    }
+    async fn run_git_with_input<I, S>(
+        &self,
+        repo: &str,
+        args: I,
+        input: &[u8],
+    ) -> std::result::Result<GitOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let repo_root = self.resolve_repo(repo)?;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("GIT_EDITOR", "true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to execute git: {error}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input)
+                .await
+                .map_err(|error| format!("failed to write git stdin: {error}"))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|error| format!("failed to wait for git: {error}"))?;
+        let mut truncated = false;
+        let output = GitOutput {
+            exit_code: output.status.code(),
+            stdout: bounded_utf8(output.stdout, self.max_output_bytes, &mut truncated),
+            stderr: bounded_utf8(output.stderr, self.max_output_bytes, &mut truncated),
+            truncated,
+        };
         if output.exit_code == Some(0) {
             Ok(output)
         } else {
@@ -2211,57 +2258,39 @@ impl GitServer {
             None => self.head_sha(&args.repo).await?,
         };
         let old_object = self.tag_object_sha(&args.repo, &args.name).await?;
-        let temp_id = NEXT_TEMP_TAG_ID.fetch_add(1, Ordering::Relaxed);
-        let safe_name = args.name.replace('/', "-");
-        let temp_name = format!(
-            "mcp-replacement/{safe_name}-{}-{temp_id}",
-            std::process::id()
+        let tagger = self
+            .run_git(&args.repo, ["var", "GIT_COMMITTER_IDENT"])
+            .await?
+            .stdout
+            .trim()
+            .to_owned();
+        if tagger.is_empty() {
+            return Err("tag replacement blocked: Git committer identity is empty".to_owned());
+        }
+        let tag_object = format!(
+            "object {new_target}\ntype commit\ntag {}\ntagger {tagger}\n\n{}\n",
+            args.name, args.message
         );
-        self.validate_tag_name(&args.repo, &temp_name).await?;
+        let new_object = self
+            .run_git_with_input(&args.repo, ["mktag"], tag_object.as_bytes())
+            .await?
+            .stdout
+            .trim()
+            .to_owned();
+        validate_object_id(&new_object)?;
+
+        let reference = format!("refs/tags/{}", args.name);
         self.run_git(
             &args.repo,
             [
-                "tag",
-                "-a",
-                temp_name.as_str(),
-                new_target.as_str(),
-                "-m",
-                args.message.as_str(),
+                "update-ref",
+                reference.as_str(),
+                new_object.as_str(),
+                old_object.as_str(),
             ],
         )
         .await?;
-        let temp_object = match self.tag_object_sha(&args.repo, &temp_name).await {
-            Ok(object) => object,
-            Err(error) => {
-                let _ = self
-                    .run_git_raw(&args.repo, ["tag", "-d", "--", temp_name.as_str()], &[])
-                    .await;
-                return Err(error);
-            }
-        };
-        let reference = format!("refs/tags/{}", args.name);
-        if let Err(error) = self
-            .run_git(
-                &args.repo,
-                [
-                    "update-ref",
-                    reference.as_str(),
-                    temp_object.as_str(),
-                    old_object.as_str(),
-                ],
-            )
-            .await
-        {
-            let _ = self
-                .run_git_raw(&args.repo, ["tag", "-d", "--", temp_name.as_str()], &[])
-                .await;
-            return Err(error);
-        }
-        let cleanup = self
-            .run_git_raw(&args.repo, ["tag", "-d", "--", temp_name.as_str()], &[])
-            .await?
-            .exit_code
-            == Some(0);
+        let cleanup = true;
         let confirmed = self.tag_target_commit(&args.repo, &args.name).await?;
         if confirmed != new_target {
             return Err("tag replacement integrity check failed: tag target does not match requested target".to_owned());
@@ -3197,7 +3226,11 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, process::Output};
+    use std::{
+        fs,
+        process::Output,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3674,6 +3707,13 @@ mod tests {
         assert_eq!(
             git_string(&workspace.repo, ["rev-parse", "v0.1.0^{commit}"]),
             new_target
+        );
+        let tag_object = git_string(&workspace.repo, ["cat-file", "-p", "refs/tags/v0.1.0"]);
+        assert!(tag_object.contains("\ntag v0.1.0\n"));
+        assert!(!tag_object.contains("mcp-replacement/"));
+        assert_eq!(
+            git_string(&workspace.repo, ["tag", "--list", "mcp-replacement/*"]),
+            ""
         );
     }
 
