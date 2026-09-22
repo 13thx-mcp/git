@@ -2,8 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::OsStr,
     path::{Component, Path, PathBuf},
-    process::Command as StdCommand,
-    sync::atomic::{AtomicU64, Ordering},
+    process::{Command as StdCommand, Stdio},
 };
 
 use anyhow::{Context, Result};
@@ -15,14 +14,13 @@ use rmcp::{
     schemars, tool, tool_router,
     transport::stdio,
 };
-use serde::Serialize;
-use tokio::process::Command;
+use serde::{Deserialize, Serialize};
+use tokio::{io::AsyncWriteExt, process::Command};
 
 const MAX_COMMIT_MESSAGE_BYTES: usize = 16_384;
 const MAX_HISTORY_COMMITS: usize = 512;
 const DEFAULT_MAX_MERGE_COMMITS: u32 = 5;
 const PROTECTED_TRUNK: &str = "main";
-static NEXT_TEMP_TAG_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Workspace-confined multi-repository Git MCP server")]
@@ -47,6 +45,18 @@ struct Cli {
 
     #[arg(long, env = "MCP_GIT_MAX_OUTPUT_BYTES", default_value_t = 1_048_576)]
     max_output_bytes: usize,
+
+    /// Root containing trusted release-gate evidence. Required only for enrolled repositories.
+    #[arg(long, env = "MCP_GIT_RELEASE_EVIDENCE_ROOT")]
+    release_evidence_root: Option<PathBuf>,
+
+    /// Comma-separated workspace-relative repositories that require exact PASS release evidence.
+    #[arg(
+        long = "release-evidence-required-repo",
+        env = "MCP_GIT_RELEASE_EVIDENCE_REQUIRED_REPOS",
+        value_delimiter = ','
+    )]
+    release_evidence_required_repos: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -56,6 +66,8 @@ struct GitServer {
     allow_remote_read: bool,
     allow_remote_write: bool,
     max_output_bytes: usize,
+    release_evidence_root: Option<PathBuf>,
+    release_evidence_required_repos: BTreeSet<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -134,6 +146,20 @@ struct ReleaseTagArgs {
     repo: String,
     version: String,
     message: Option<String>,
+    /// Path to trusted release-gate evidence below the configured evidence root.
+    release_evidence_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseEvidence {
+    schema_version: u32,
+    gate: String,
+    status: String,
+    repo: String,
+    project_key: String,
+    commit: String,
+    branch: String,
+    analysis_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -492,6 +518,18 @@ impl GitServer {
             allow_remote_read: cli.allow_remote || cli.allow_remote_read,
             allow_remote_write: cli.allow_remote || cli.allow_remote_write,
             max_output_bytes: cli.max_output_bytes.max(1),
+            release_evidence_root: cli
+                .release_evidence_root
+                .as_ref()
+                .map(std::fs::canonicalize)
+                .transpose()
+                .with_context(|| "cannot resolve release evidence root")?,
+            release_evidence_required_repos: cli
+                .release_evidence_required_repos
+                .iter()
+                .map(|repo| clean_repo_path(repo).map(|path| path.to_string_lossy().into_owned()))
+                .collect::<std::result::Result<BTreeSet<_>, _>>()
+                .map_err(anyhow::Error::msg)?,
         })
     }
 
@@ -682,6 +720,55 @@ impl GitServer {
         S: AsRef<OsStr>,
     {
         let output = self.run_git_raw(repo, args, &[]).await?;
+        if output.exit_code == Some(0) {
+            Ok(output)
+        } else {
+            Err(format_git_failure(&output))
+        }
+    }
+    async fn run_git_with_input<I, S>(
+        &self,
+        repo: &str,
+        args: I,
+        input: &[u8],
+    ) -> std::result::Result<GitOutput, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let repo_root = self.resolve_repo(repo)?;
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&repo_root)
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(args)
+            .env("GIT_PAGER", "cat")
+            .env("PAGER", "cat")
+            .env("GIT_EDITOR", "true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("failed to execute git: {error}"))?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(input)
+                .await
+                .map_err(|error| format!("failed to write git stdin: {error}"))?;
+        }
+
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|error| format!("failed to wait for git: {error}"))?;
+        let mut truncated = false;
+        let output = GitOutput {
+            exit_code: output.status.code(),
+            stdout: bounded_utf8(output.stdout, self.max_output_bytes, &mut truncated),
+            stderr: bounded_utf8(output.stderr, self.max_output_bytes, &mut truncated),
+            truncated,
+        };
         if output.exit_code == Some(0) {
             Ok(output)
         } else {
@@ -2171,57 +2258,39 @@ impl GitServer {
             None => self.head_sha(&args.repo).await?,
         };
         let old_object = self.tag_object_sha(&args.repo, &args.name).await?;
-        let temp_id = NEXT_TEMP_TAG_ID.fetch_add(1, Ordering::Relaxed);
-        let safe_name = args.name.replace('/', "-");
-        let temp_name = format!(
-            "mcp-replacement/{safe_name}-{}-{temp_id}",
-            std::process::id()
+        let tagger = self
+            .run_git(&args.repo, ["var", "GIT_COMMITTER_IDENT"])
+            .await?
+            .stdout
+            .trim()
+            .to_owned();
+        if tagger.is_empty() {
+            return Err("tag replacement blocked: Git committer identity is empty".to_owned());
+        }
+        let tag_object = format!(
+            "object {new_target}\ntype commit\ntag {}\ntagger {tagger}\n\n{}\n",
+            args.name, args.message
         );
-        self.validate_tag_name(&args.repo, &temp_name).await?;
+        let new_object = self
+            .run_git_with_input(&args.repo, ["mktag"], tag_object.as_bytes())
+            .await?
+            .stdout
+            .trim()
+            .to_owned();
+        validate_object_id(&new_object)?;
+
+        let reference = format!("refs/tags/{}", args.name);
         self.run_git(
             &args.repo,
             [
-                "tag",
-                "-a",
-                temp_name.as_str(),
-                new_target.as_str(),
-                "-m",
-                args.message.as_str(),
+                "update-ref",
+                reference.as_str(),
+                new_object.as_str(),
+                old_object.as_str(),
             ],
         )
         .await?;
-        let temp_object = match self.tag_object_sha(&args.repo, &temp_name).await {
-            Ok(object) => object,
-            Err(error) => {
-                let _ = self
-                    .run_git_raw(&args.repo, ["tag", "-d", "--", temp_name.as_str()], &[])
-                    .await;
-                return Err(error);
-            }
-        };
-        let reference = format!("refs/tags/{}", args.name);
-        if let Err(error) = self
-            .run_git(
-                &args.repo,
-                [
-                    "update-ref",
-                    reference.as_str(),
-                    temp_object.as_str(),
-                    old_object.as_str(),
-                ],
-            )
-            .await
-        {
-            let _ = self
-                .run_git_raw(&args.repo, ["tag", "-d", "--", temp_name.as_str()], &[])
-                .await;
-            return Err(error);
-        }
-        let cleanup = self
-            .run_git_raw(&args.repo, ["tag", "-d", "--", temp_name.as_str()], &[])
-            .await?
-            .exit_code
-            == Some(0);
+        let cleanup = true;
         let confirmed = self.tag_target_commit(&args.repo, &args.name).await?;
         if confirmed != new_target {
             return Err("tag replacement integrity check failed: tag target does not match requested target".to_owned());
@@ -2235,6 +2304,60 @@ impl GitServer {
             publication_guard: args.publication_guard,
             temporary_tag_cleanup: cleanup,
         })
+    }
+
+    fn verify_release_evidence(
+        &self,
+        repo: &str,
+        head: &str,
+        evidence_path: Option<&str>,
+    ) -> std::result::Result<(), String> {
+        let repo_selector = clean_repo_path(repo)?.to_string_lossy().into_owned();
+        if !self
+            .release_evidence_required_repos
+            .contains(&repo_selector)
+        {
+            return Ok(());
+        }
+
+        let evidence_root = self.release_evidence_root.as_ref().ok_or_else(|| {
+            "release evidence is required for this repository but no evidence root is configured"
+                .to_owned()
+        })?;
+        let relative = evidence_path.ok_or_else(|| {
+            "release evidence is required for this repository; provide release_evidence_path"
+                .to_owned()
+        })?;
+        let relative = clean_repo_path(relative)?;
+        let requested = evidence_root.join(relative);
+        let canonical = std::fs::canonicalize(&requested)
+            .map_err(|error| format!("cannot resolve release evidence: {error}"))?;
+        if !canonical.starts_with(evidence_root) || !canonical.is_file() {
+            return Err(
+                "release evidence must be a regular file below the configured evidence root"
+                    .to_owned(),
+            );
+        }
+
+        let raw = std::fs::read(&canonical)
+            .map_err(|error| format!("cannot read release evidence: {error}"))?;
+        let evidence: ReleaseEvidence = serde_json::from_slice(&raw)
+            .map_err(|error| format!("invalid release evidence JSON: {error}"))?;
+        let repo_root = self.resolve_repo(repo)?;
+        if evidence.schema_version != 1
+            || evidence.gate != "sonarqube-main"
+            || evidence.status != "PASS"
+            || evidence.branch != PROTECTED_TRUNK
+            || evidence.commit != head
+            || evidence.repo != repo_root.to_string_lossy()
+            || evidence.project_key.trim().is_empty()
+            || evidence.analysis_id.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(
+                "release evidence does not prove a PASS for the current main HEAD".to_owned(),
+            );
+        }
+        Ok(())
     }
 
     async fn create_release_tag(
@@ -2256,6 +2379,7 @@ impl GitServer {
                 "release tagging requires HEAD to be the two-parent no-ff merge result".to_owned(),
             );
         }
+        self.verify_release_evidence(&args.repo, &head.sha, args.release_evidence_path.as_deref())?;
         let name = format!("v{}", args.version);
         self.validate_tag_name(&args.repo, &name).await?;
         let reference = format!("refs/tags/{name}");
@@ -2745,7 +2869,7 @@ impl GitServer {
     }
 
     #[tool(
-        description = "Create an annotated vMAJOR.MINOR.PATCH release tag only on a clean main whose HEAD is the two-parent no-ff merge result."
+        description = "Create an annotated vMAJOR.MINOR.PATCH release tag only on a clean two-parent main merge, enforcing exact PASS release evidence for enrolled repositories."
     )]
     async fn git_release_tag(
         &self,
@@ -3102,7 +3226,11 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, process::Output};
+    use std::{
+        fs,
+        process::Output,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3134,6 +3262,8 @@ mod tests {
                 allow_remote_read: false,
                 allow_remote_write: false,
                 max_output_bytes: 1_048_576,
+                release_evidence_root: None,
+                release_evidence_required_repos: BTreeSet::new(),
             }
         }
 
@@ -3578,6 +3708,13 @@ mod tests {
             git_string(&workspace.repo, ["rev-parse", "v0.1.0^{commit}"]),
             new_target
         );
+        let tag_object = git_string(&workspace.repo, ["cat-file", "-p", "refs/tags/v0.1.0"]);
+        assert!(tag_object.contains("\ntag v0.1.0\n"));
+        assert!(!tag_object.contains("mcp-replacement/"));
+        assert_eq!(
+            git_string(&workspace.repo, ["tag", "--list", "mcp-replacement/*"]),
+            ""
+        );
     }
 
     #[tokio::test]
@@ -3599,11 +3736,78 @@ mod tests {
                 repo: "repo".to_owned(),
                 version: "1.0.0".to_owned(),
                 message: None,
+                release_evidence_path: None,
             })
             .await
             .unwrap();
         assert_eq!(
             git_string(&workspace.repo, ["rev-parse", "v1.0.0^{commit}"]),
+            workspace.head()
+        );
+    }
+
+    #[tokio::test]
+    async fn release_tag_enforcement_requires_exact_pass_evidence() {
+        let workspace = TestWorkspace::new();
+        let mut server = workspace.server(false);
+        server
+            .create_branch("repo", "feature/evidence", None, true)
+            .await
+            .unwrap();
+        workspace.commit_file("feature.txt", "feature\n", "feat: evidence fixture");
+        server.switch_branch("repo", PROTECTED_TRUNK).await.unwrap();
+        server
+            .merge_branch("repo", "feature/evidence", MergeMode::NoFf, None)
+            .await
+            .unwrap();
+
+        let evidence_root = workspace.root.join("evidence");
+        fs::create_dir_all(evidence_root.join("repo-project")).unwrap();
+        server.release_evidence_root = Some(fs::canonicalize(&evidence_root).unwrap());
+        server
+            .release_evidence_required_repos
+            .insert("repo".to_owned());
+
+        let missing = server
+            .create_release_tag(&ReleaseTagArgs {
+                repo: "repo".to_owned(),
+                version: "1.1.0".to_owned(),
+                message: None,
+                release_evidence_path: None,
+            })
+            .await;
+        assert!(missing.is_err());
+
+        let head = workspace.head();
+        let relative = format!("repo-project/{head}.json");
+        let evidence_path = evidence_root.join(&relative);
+        fs::write(
+            &evidence_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": 1,
+                "gate": "sonarqube-main",
+                "status": "PASS",
+                "repo": fs::canonicalize(&workspace.repo).unwrap().to_string_lossy(),
+                "project_key": "repo-project",
+                "commit": head,
+                "branch": "main",
+                "analysis_id": "analysis-1"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        server
+            .create_release_tag(&ReleaseTagArgs {
+                repo: "repo".to_owned(),
+                version: "1.1.0".to_owned(),
+                message: None,
+                release_evidence_path: Some(relative),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            git_string(&workspace.repo, ["rev-parse", "v1.1.0^{commit}"]),
             workspace.head()
         );
     }

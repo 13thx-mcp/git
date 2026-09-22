@@ -18,6 +18,7 @@ All notable changes to Rust Git MCP are documented here.
 
 ### Changed
 
+- `git_replace_local_tag` now creates the replacement annotated object with the canonical requested tag name before compare-and-swap ref replacement, preventing temporary internal tag names from leaking into release metadata.
 - `git_commit`, `git_amend_commit`, `git_reword_commits`, and `git_squash_commits` now require Conventional Commit-compatible authored subjects.
 - Normal commits on protected `main` are rejected; `git_commit` only permits `main` when completing an explicit merge in progress.
 - `git_merge` now requires current branch `main`, a clean worktree/index, explicit no-fast-forward semantics, and a Conventional Commit-compatible merge message. If no message is supplied, one is derived from the work-branch prefix.
